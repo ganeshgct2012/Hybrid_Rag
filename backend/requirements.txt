@@ -3,13 +3,13 @@ uvicorn[standard]
 python-multipart
 pydantic-settings
 python-dotenv
+
 langchain
 langchain-community
 langchain-openai
 langchain-chroma
 langchain-neo4j
 langchain-experimental
+
 pypdf
-streamlit
-requests
 certifi

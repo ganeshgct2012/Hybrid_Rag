@@ -16,6 +16,7 @@ ALIASES = {
     "hlsjs": "HLS.js",
     "oauth2": "OAuth 2.0",
     "oauth": "OAuth 2.0",
+    "oauth2oidc": "OAuth 2.0",
     "pwa": "PWA",
     "nestjs": "NestJS",
     "nodejs": "Node.js",
@@ -25,8 +26,9 @@ ALIASES = {
     "apigateway": "API Gateway",
     "rest": "REST",
     "graphql": "GraphQL",
+    "grpc": "gRPC",
     "rabbitmq": "RabbitMQ",
-    "oauth2oidc": "OAuth 2.0",
+    "elasticsearchopensearch": "Elasticsearch/OpenSearch",
 }
 
 
@@ -39,11 +41,12 @@ def get_graph() -> Neo4jGraph:
     )
 
 
-def get_llm() -> ChatOpenAI:
+def get_llm(max_tokens: int | None = None) -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.llm_model,
         api_key=settings.openai_api_key,
         temperature=0,
+        max_tokens=max_tokens,
     )
 
 
@@ -81,6 +84,35 @@ def normalize_graph_documents(graph_docs):
     return graph_docs
 
 
+def _extract_with_fallback(transformer, chunk: Document, depth: int = 0):
+    """Extract entities from one chunk.
+
+    Sometimes the LLM produces runaway output for a chunk and the response is cut off.
+    In that case we split the chunk in half and try each half. Errors that are not about
+    the LLM output (wrong API key, no credit) are raised immediately.
+    Returns (graph_documents, number_of_skipped_pieces).
+    """
+    try:
+        return transformer.convert_to_graph_documents([chunk]), 0
+    except Exception as e:
+        msg = str(e).lower()
+        recoverable = "length limit" in msg or "could not parse" in msg or "validation" in msg
+        if not recoverable:
+            raise
+        if depth >= 2 or len(chunk.page_content) < 400:
+            print(f"[graph] skipped one piece of text: {str(e)[:150]}")
+            return [], 1
+
+        mid = len(chunk.page_content) // 2
+        docs, skipped = [], 0
+        for text in (chunk.page_content[:mid], chunk.page_content[mid:]):
+            half = Document(page_content=text, metadata=chunk.metadata)
+            d, s = _extract_with_fallback(transformer, half, depth + 1)
+            docs.extend(d)
+            skipped += s
+        return docs, skipped
+
+
 def ingest_to_graph(docs: list[Document], doc_id: str) -> dict:
     """Extract entities/relations, normalize, and store in Neo4j."""
     chunks = chunk_for_graph(docs)
@@ -88,11 +120,21 @@ def ingest_to_graph(docs: list[Document], doc_id: str) -> dict:
         c.metadata["doc_id"] = doc_id
 
     transformer = LLMGraphTransformer(
-        llm=get_llm(),
+        llm=get_llm(max_tokens=4096),  # cap the output, so a runaway response stops early
         allowed_nodes=["Layer", "Technology", "Service", "Database", "Feature", "Protocol"],
         allowed_relationships=["USES", "PART_OF", "DEPENDS_ON", "STORES_DATA_IN", "PROVIDES"],
     )
-    graph_docs = transformer.convert_to_graph_documents(chunks)
+
+    graph_docs = []
+    skipped = 0
+    for chunk in chunks:
+        result, s = _extract_with_fallback(transformer, chunk)
+        graph_docs.extend(result)
+        skipped += s
+
+    if not graph_docs:
+        raise RuntimeError("Graph extraction failed for every chunk of this PDF.")
+
     graph_docs = normalize_graph_documents(graph_docs)
 
     graph = get_graph()
@@ -100,6 +142,7 @@ def ingest_to_graph(docs: list[Document], doc_id: str) -> dict:
 
     return {
         "chunks": len(chunks),
+        "skipped_pieces": skipped,
         "nodes": sum(len(g.nodes) for g in graph_docs),
         "relationships": sum(len(g.relationships) for g in graph_docs),
     }

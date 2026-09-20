@@ -1,3 +1,4 @@
+import difflib
 import re
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
@@ -30,18 +31,48 @@ def extract_entities_with_llm(question: str) -> list[str]:
         return []
 
 
+def _key(text: str) -> str:
+    """Lowercase and keep only letters/digits: 'Front End' and 'Frontend' both become 'frontend'."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 def find_entities_in_graph(graph, question: str) -> list[str]:
     """Check every entity name stored in the graph against the question text.
-    This does not depend on the LLM, so 'frontend' in the question finds the 'Frontend' node."""
+
+    1. Word groups of 1-4 words are joined without spaces, so 'front end' matches
+       the 'Frontend' node and 'tan stack query' matches 'TanStack Query'.
+    2. Close spellings are matched too, so the typo 'frond end' still finds 'Frontend'.
+
+    This does not depend on the LLM."""
     rows = graph.query("MATCH (e:__Entity__) RETURN DISTINCT e.id AS id")
-    q = question.lower()
-    found = []
+
+    # normalized key -> original entity name
+    entity_keys = {}
     for r in rows:
         name = str(r["id"])
-        if len(name) < 3:
+        k = _key(name)
+        if len(k) >= 3:
+            entity_keys.setdefault(k, name)
+
+    words = re.findall(r"[A-Za-z0-9]+", question)
+    phrases = set()
+    for size in (1, 2, 3, 4):
+        for i in range(len(words) - size + 1):
+            phrases.add(_key("".join(words[i:i + size])))
+
+    # 1. exact match after normalizing
+    found = [name for k, name in entity_keys.items() if k in phrases]
+
+    # 2. typo tolerance (only for longer names, to avoid false matches)
+    long_keys = [k for k in entity_keys if len(k) >= 7]
+    for phrase in phrases:
+        if len(phrase) < 7:
             continue
-        if re.search(rf"(?<!\w){re.escape(name.lower())}(?!\w)", q):
-            found.append(name)
+        for k in difflib.get_close_matches(phrase, long_keys, n=1, cutoff=0.85):
+            name = entity_keys[k]
+            if name not in found:
+                found.append(name)
+
     return found
 
 
@@ -68,17 +99,20 @@ def graph_search(question: str, limit: int = 25) -> tuple[list[str], list[str]]:
     fuzzy = [n for n in extract_entities_with_llm(question) if len(n) >= 3 and n not in exact]
 
     facts = []
+    used = list(exact)
     for name, is_fuzzy in [(n, False) for n in exact] + [(n, True) for n in fuzzy]:
         rows = graph.query(
             GRAPH_QUERY, params={"name": name, "fuzzy": is_fuzzy, "limit": limit}
         )
+        if is_fuzzy and rows:
+            used.append(name)
         for r in rows:
             if r["outgoing"]:
                 facts.append(f"{r['entity']} -[{r['relation']}]-> {r['other']}")
             else:
                 facts.append(f"{r['other']} -[{r['relation']}]-> {r['entity']}")
 
-    return list(dict.fromkeys(facts)), exact + fuzzy
+    return list(dict.fromkeys(facts)), used
 
 
 # ---------- Part 3: vector search (Chroma) ----------

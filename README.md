@@ -47,6 +47,55 @@ flowchart TD
 2. **Graph search** finds entity names from the graph that appear in the question (for example, "frontend" matches the `Frontend` node). An LLM also suggests extra entity names. Their 1-hop relationships are fetched from Neo4j as facts like `Frontend -[USES]-> Next.js`.
 3. The LLM answers using only these two sources, and says so if the answer is not there.
 
+## How the answers are combined
+
+The two retrieval results are combined **inside the prompt**, before the LLM writes the answer. There is no score merging or re-ranking. The code is in `answer_question()` in `backend/app/retrieval/hybrid.py`.
+
+1. **Each search returns a different kind of output.** Vector search returns text chunks tagged with their page number. Graph search returns relationship rows from Neo4j.
+2. **Graph rows are turned into plain text lines**, for example `Frontend -[USES]-> Next.js`, so the LLM can read them like any other text.
+3. **Both go into one prompt, in two labeled sections**, together with the question:
+
+```
+Document excerpts:
+[page 1] Frontend:
+- Next.js (React + TypeScript) for SSR/SSG and SPA behavior.
+- Tailwind CSS with a component library ...
+
+Knowledge graph facts:
+Frontend -[USES]-> Next.js
+Frontend -[USES]-> Tailwind CSS
+Frontend -[USES]-> TanStack Query
+
+Question: What technologies does the frontend use?
+```
+
+4. **The LLM writes one answer from both.** The system prompt tells it to use only this context and to say it does not know if the answer is missing.
+
+### Why use both
+
+| Source | Good at |
+|---|---|
+| Vector chunks | The document's actual wording and detail, with page numbers |
+| Graph facts | Completeness and connections: everything linked to an entity, even when it is spread across different chunks or pages |
+
+For example, if a document mentions the backend's databases on pages 2, 4 and 5, vector search may return only two of those chunks, while the graph holds every `USES` link for that entity.
+
+### Which graph entities are used
+
+Graph search does not rely only on the LLM to find entity names in the question. `find_entities_in_graph()` checks every entity name stored in the graph against the question:
+
+- Words are joined without spaces, so "front end" matches `Frontend` and "tan stack query" matches `TanStack Query`.
+- Close spellings match too, so the typo "frond end" still finds `Frontend`. This applies only to names of 7 or more letters, to avoid false matches on short names.
+- The LLM adds extra name suggestions on top of these.
+
+The app shows the result under each answer: the entities matched, the graph facts used, and the pages the vector search returned.
+
+### Limits
+
+- **No ranking between the two sources.** Both are given to the LLM, which decides what to use.
+- **The graph side can be empty.** If no entity in the question matches a node, the prompt says no graph facts were found, and the answer comes from vector search alone.
+- **Graph facts are capped** at 25 per entity and are only 1 hop away.
+
 ## Tech stack
 
 | Layer | Choice |
